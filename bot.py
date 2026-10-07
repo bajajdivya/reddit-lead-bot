@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -161,12 +162,23 @@ def main():
     before = len(seen)
     token = reddit_token() if os.environ.get("REDDIT_CLIENT_ID") else None
     failures = 0
-    for sub in SUBREDDITS:
-        try:
-            check(sub, token, seen, known)
-        except Exception as exc:
-            print(f"r/{sub}: {exc}")
-            failures += 1
+    for i, sub in enumerate(SUBREDDITS):
+        if i:
+            time.sleep(5)
+        for attempt in range(3):
+            try:
+                check(sub, token, seen, known)
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429 or attempt == 2:
+                    print(f"r/{sub}: {exc}")
+                    failures += 1
+                    break
+                time.sleep(20 * (attempt + 1))
+            except Exception as exc:
+                print(f"r/{sub}: {exc}")
+                failures += 1
+                break
     if len(seen) > before:
         SEEN_FILE.parent.mkdir(exist_ok=True)
         SEEN_FILE.write_text(json.dumps(seen[-3000:]))
