@@ -5,7 +5,9 @@ Finds new hiring posts in SUBREDDITS that match KEYWORDS, drafts a reply with Cl
 (optional) and sends both to Telegram. It never posts, comments or DMs on Reddit.
 
 Environment:
-  REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET   Reddit API app (read-only, no password needed)
+  REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET   Reddit API app (read-only, no password needed).
+                                           If unset, falls back to the public RSS feeds, which
+                                           Reddit sometimes blocks from cloud servers.
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID     where alerts go
   ANTHROPIC_API_KEY                        optional; without it alerts come with no draft
 """
@@ -16,6 +18,8 @@ import re
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -54,12 +58,36 @@ def fetch_new(subreddit, token):
     return [child["data"] for child in listing["data"]["children"]]
 
 
+def fetch_rss(subreddit):
+    """Fallback without API keys. The feed has no flair, so r/ForHireFreelance posts are all
+    treated as possible hiring posts and the For Hire ads are filtered out by title."""
+    req = urllib.request.Request(
+        f"https://www.reddit.com/r/{subreddit}/new/.rss?limit=50", headers={"User-Agent": USER_AGENT}
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        root = ET.fromstring(resp.read())
+    atom = {"a": "http://www.w3.org/2005/Atom"}
+    posts = []
+    for entry in root.findall("a:entry", atom):
+        link = entry.find("a:link", atom).get("href")
+        stamp = entry.findtext("a:updated", "", atom) or entry.findtext("a:published", "", atom)
+        posts.append({
+            "name": entry.findtext("a:id", "", atom),
+            "title": entry.findtext("a:title", "", atom),
+            "selftext": re.sub(r"<[^>]+>", " ", entry.findtext("a:content", "", atom)),
+            "created_utc": datetime.fromisoformat(stamp).timestamp(),
+            "permalink": urllib.parse.urlparse(link).path,
+            "assume_hiring": subreddit == "ForHireFreelance",
+        })
+    return posts
+
+
 def is_lead(post):
     title = post["title"]
     flair = (post.get("link_flair_text") or "").lower()
     if "for hire" in flair or re.search(r"for\s*hire", title, re.I):
         return None
-    if "hiring" not in flair and not re.match(r"\s*\[hiring\]", title, re.I):
+    if not post.get("assume_hiring") and "hiring" not in flair and not re.match(r"\s*\[hiring\]", title, re.I):
         return None
     text = f"{title} {post.get('selftext', '')}".lower()
     return [k for k in KEYWORDS if k in text] or None
@@ -105,7 +133,7 @@ def telegram(text):
 
 def check(sub, token, seen, known):
     cutoff = time.time() - MAX_AGE_HOURS * 3600
-    for post in reversed(fetch_new(sub, token)):
+    for post in reversed(fetch_new(sub, token) if token else fetch_rss(sub)):
         if post["name"] in known:
             continue
         matched = is_lead(post) if post["created_utc"] >= cutoff else None
@@ -131,7 +159,7 @@ def main():
     seen = json.loads(SEEN_FILE.read_text()) if SEEN_FILE.exists() else []
     known = set(seen)
     before = len(seen)
-    token = reddit_token()
+    token = reddit_token() if os.environ.get("REDDIT_CLIENT_ID") else None
     failures = 0
     for sub in SUBREDDITS:
         try:
